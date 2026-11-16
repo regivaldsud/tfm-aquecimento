@@ -143,6 +143,12 @@ button:focus-visible,select:focus-visible,input:focus-visible{outline:3px solid 
 .next-go b .ic{width:26px;height:26px}.next-thumb .end .ic{width:44px;height:44px;color:#143e2c}
 .photo .placeholder .ic{width:clamp(72px,9vw,112px);height:clamp(72px,9vw,112px);stroke-width:1.5}
 .roster-check .ic{width:19px;height:19px;stroke-width:2.6}
+.voice-box{border-top:1px solid #28463a;margin-top:9px;padding-top:12px}
+.voice-box label{display:flex;align-items:center;gap:9px;font-size:13px;margin-bottom:8px}
+.voice-box label .ic{color:var(--yellow);width:20px;height:20px}
+.voice-row{display:flex;gap:8px}
+.voice-row select{flex:1;min-width:0;background:#09281f;color:#fff;border:1px solid #49665b;border-radius:9px;padding:10px}
+.voice-box small{display:block;color:var(--muted);font-size:12px;margin-top:7px}
 @media(max-width:1100px){.layout{grid-template-columns:1fr}.side{display:grid;grid-template-columns:1fr 1fr}}
 @media(max-width:760px){
  .shell{padding:calc(10px + env(safe-area-inset-top)) calc(14px + env(safe-area-inset-right)) calc(22px + env(safe-area-inset-bottom)) calc(14px + env(safe-area-inset-left))}
@@ -225,7 +231,11 @@ button:focus-visible,select:focus-visible,input:focus-visible{outline:3px solid 
      <option value="0.15">Baixo</option><option value="0.45">Médio</option><option value="0.8">Alto</option></select></div>
   </div>
   <div class="toggle-row"><span><i data-ic="volume"></i>Bipes e contagem dos 3 últimos segundos</span><input id="sound" type="checkbox" checked aria-label="Ativar avisos sonoros"/></div>
-  <div class="toggle-row"><span><i data-ic="speakerphone"></i>Anunciar os exercícios em voz alta</span><input id="voice" type="checkbox" checked aria-label="Ativar voz"/></div>
+  <div class="voice-box">
+   <label for="voz"><i data-ic="speakerphone"></i>Voz que anuncia os exercícios</label>
+   <div class="voice-row"><select id="voz"></select><button class="btn small" id="voicePreview" type="button" aria-label="Ouvir a voz escolhida"><i data-ic="player-play"></i><span class="lbl">Ouvir</span></button></div>
+   <small id="voiceInfo"></small>
+  </div>
   <div class="summary" id="summary"></div>
   <p class="note">As configurações ficam salvas neste navegador. Mudar um tempo mantém você no exercício atual.</p>
  </section>
@@ -262,9 +272,23 @@ const RING=552.92;
 const STORE='tfm_dynamic_config_v2';
 
 /* ---------- Configuração ---------- */
-const DEFAULTS={mode:'auto',warmup:120,duration:15,interval:0,volume:0.45,sound:true,voice:true};
+const DEFAULTS={mode:'auto',warmup:120,duration:15,interval:0,volume:0.45,sound:true,voz:'pedra'};
 let cfg={...DEFAULTS};
 try{cfg={...cfg,...JSON.parse(localStorage.getItem(STORE)||'{}')}}catch{}
+if(cfg.voice===false&&!localStorage.getItem(STORE+'_voz'))cfg.voz='off';
+delete cfg.voice;
+/* Vozes naturais (Kokoro, mesmas receitas do Xadrez de Bolso 3D), já gravadas no app */
+const VOZES={"lista":[{"id":"cacau","nome":"Cacau","genero":"F","desc":"atleta"},{"id":"dandara","nome":"Dandara","genero":"F","desc":"destemida"},{"id":"jurema","nome":"Jurema","genero":"F","desc":"mandona"},{"id":"lili","nome":"Lili","genero":"F","desc":"animada"},{"id":"pedra","nome":"Sargento Pedra","genero":"M","desc":"militar"},{"id":"trovao","nome":"Trovão","genero":"M","desc":"enérgico"},{"id":"afonso","nome":"Dom Afonso","genero":"M","desc":"tranquilo"},{"id":"bigode","nome":"Bigode","genero":"M","desc":"veterano"}],"clips":{},"lazy":true};
+const isNatural=id=>VOZES.lista.some(v=>v.id===id);
+if(cfg.voz!=='off'&&cfg.voz!=='sistema'&&!isNatural(cfg.voz))cfg.voz=DEFAULTS.voz;
+/* No app instalado cada voz é um arquivo à parte (vozes/<id>.json), baixado só quando escolhido. */
+const voiceLoading={};
+function ensureVoice(id){
+ if(VOZES.clips[id])return Promise.resolve(VOZES.clips[id]);
+ if(!VOZES.lazy||!isNatural(id))return Promise.resolve(null);
+ return voiceLoading[id]??=fetch('vozes/'+id+'.json').then(r=>r.ok?r.json():null).then(c=>{if(c)VOZES.clips[id]=c;else delete voiceLoading[id];return c}).catch(()=>{delete voiceLoading[id];return null});
+}
+let lastVoz=cfg.voz==='off'?DEFAULTS.voz:cfg.voz;
 function save(){try{localStorage.setItem(STORE,JSON.stringify(cfg))}catch{}}
 
 /* ---------- Estado ---------- */
@@ -325,16 +349,40 @@ function beep(f=880,ms=110){
   o.type='sine';o.frequency.value=f;g.gain.setValueAtTime(v*.15,t);g.gain.exponentialRampToValueAtTime(.0001,t+ms/1000);
   o.connect(g);g.connect(audioCtx.destination);o.start();o.stop(t+ms/1000)}catch{}
 }
-function speak(msg){
- if(!cfg.voice||!('speechSynthesis'in window))return;
+function getCtx(){try{audioCtx??=new (window.AudioContext||window.webkitAudioContext)();if(audioCtx.state==='suspended')audioCtx.resume()}catch{}return audioCtx}
+const voiceBuf={};let voiceSrc=null,speakSeq=0;
+function stopVoice(){speakSeq++;try{voiceSrc?.stop()}catch{}voiceSrc=null;try{speechSynthesis.cancel()}catch{}}
+function clip(id,key){
+ const k=id+':'+key;if(voiceBuf[k])return voiceBuf[k];
+ voiceBuf[k]=ensureVoice(id).then(c=>{
+  const uri=c?.[key];if(!uri)return null;
+  const bin=atob(uri.slice(uri.indexOf(',')+1)),u8=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)u8[i]=bin.charCodeAt(i);
+  const ac=getCtx();return new Promise((ok,fail)=>ac.decodeAudioData(u8.buffer,ok,fail));
+ }).then(b=>{if(!b)delete voiceBuf[k];return b}).catch(()=>{delete voiceBuf[k];return null});
+ return voiceBuf[k];
+}
+function preloadVoice(){const v=cfg.voz;if(audioCtx&&isNatural(v))ensureVoice(v).then(c=>c&&Object.keys(c).forEach(k=>clip(v,k)))}
+function systemSpeak(msg){
+ if(!('speechSynthesis'in window))return;
  try{speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(msg);u.lang='pt-BR';u.rate=1.05;
   const br=speechSynthesis.getVoices().find(v=>v.lang.toLowerCase().startsWith('pt-br'));if(br)u.voice=br;speechSynthesis.speak(u)}catch{}
 }
+/* Fala uma frase: voz natural gravada (key) ou, se não houver, a voz do aparelho (texto). */
+async function say(key,text,delay=.22){
+ const v=cfg.voz;if(v==='off')return;
+ stopVoice();const seq=speakSeq;
+ if(isNatural(v)){
+  const b=await clip(v,key);if(seq!==speakSeq)return;
+  if(b){const ac=getCtx(),src=ac.createBufferSource(),g=ac.createGain();g.gain.value=Math.min(1,.55+ +cfg.volume);
+   src.buffer=b;src.connect(g);g.connect(ac.destination);src.start(ac.currentTime+delay);voiceSrc=src;return}
+ }
+ systemSpeak(text);
+}
 function announce(){
  if(announced===at)return;announced=at;const s=stage();beep(850,190);
- if(s.type==='warmup')speak(`Corrida lenta, ${human(s.seconds).replace('min','minutos').replace(' s',' segundos')}.`);
- else if(s.type==='rest')speak('Intervalo. A seguir: '+EXERCISES[s.ex]);
- else speak(`Exercício ${s.ex+1}. ${EXERCISES[s.ex]}`);
+ if(s.type==='warmup')say('w'+s.seconds,`Corrida lenta, ${human(s.seconds).replace('min','minutos').replace(' s',' segundos')}.`);
+ else if(s.type==='rest')say('r'+s.ex,'Intervalo. A seguir: '+EXERCISES[s.ex]);
+ else say('e'+s.ex,`Exercício ${s.ex+1}. ${EXERCISES[s.ex]}`);
 }
 async function lockScreen(){try{if('wakeLock'in navigator&&!wakeLock){wakeLock=await navigator.wakeLock.request('screen');wakeLock.addEventListener?.('release',()=>wakeLock=null)}}catch{}}
 function unlockScreen(){try{wakeLock?.release()}catch{}wakeLock=null}
@@ -356,7 +404,7 @@ function update(){
   }else{
    base=s.seconds;state='timeup';beep(1030,260);
    const nx=nextExerciseIndex();
-   speak(nx<0?'Tempo! Último exercício concluído.':'Tempo! Toque em próximo exercício.');
+   say(nx<0?'tl':'tu',nx<0?'Tempo! Último exercício concluído.':'Tempo! Toque em próximo exercício.',.3);
    toast(nx<0?'Tempo! Toque para concluir.':'Tempo! Toque em “Próximo exercício”.');
   }
  }
@@ -368,9 +416,10 @@ function start(){
  if(state==='done')reset();
  if(state==='running')return;
  if(state==='timeup'){goNext();return}
+ getCtx();preloadVoice();
  state='running';runStart=now();announce();lockScreen();startTicker();render();
 }
-function pause(){if(state!=='running')return;base=elapsed();state='paused';unlockScreen();try{speechSynthesis.cancel()}catch{}render()}
+function pause(){if(state!=='running')return;base=elapsed();state='paused';unlockScreen();stopVoice();render()}
 function startPause(){state==='running'?pause():start()}
 function goTo(i){
  if(i<0||i>=timeline.length)return;
@@ -395,8 +444,8 @@ function goPrev(){
  if(j>=0)goTo(j);else{base=0;runStart=now();render()}
 }
 function jumpTo(ex){const i=timeline.findIndex(s=>s.type==='exercise'&&s.ex===ex);goTo(i)}
-function finish(){state='done';base=0;unlockScreen();stopTicker();beep(900,320);speak('Aquecimento dinâmico concluído. Muito bem!');toast('Aquecimento concluído!');render()}
-function reset(){stopTicker();unlockScreen();try{speechSynthesis.cancel()}catch{}timeline=build();at=0;base=0;state='idle';announced=-1;lastRemain=null;createRoster();render()}
+function finish(){state='done';base=0;unlockScreen();stopTicker();beep(900,320);say('fim','Aquecimento dinâmico concluído. Muito bem!',.4);toast('Aquecimento concluído!');render()}
+function reset(){stopTicker();unlockScreen();stopVoice();timeline=build();at=0;base=0;state='idle';announced=-1;lastRemain=null;createRoster();render()}
 function setMode(m){
  if(cfg.mode===m)return;cfg.mode=m;save();
  rebuild();
@@ -465,7 +514,7 @@ function render(){
  $('nextCard').classList.toggle('attention',timeup);
 
  // botões
- $('startPause').innerHTML=state==='running'?ic('player-pause')+'Pausar':timeup?(j<0?ic('check')+'Concluir':ic('player-track-next')+'Próximo<span class="xl">&nbsp;exercício</span>'):state==='paused'?ic('player-play')+'Continuar':done?ic('rotate')+'Nova sessão':ic('player-play')+'Iniciar<span class="xl">&nbsp;sessão</span>';
+ $('startPause').innerHTML=state==='running'?ic('player-pause')+'Pausar':timeup?(j<0?ic('check')+'Concluir':ic('player-track-next')+'<span>Próximo<span class="xl"> exercício</span></span>'):state==='paused'?ic('player-play')+'Continuar':done?ic('rotate')+'Nova sessão':ic('player-play')+'<span>Iniciar<span class="xl"> sessão</span></span>';
  $('previous').disabled=at===0&&!done&&elapsed()<=3;
  $('next').disabled=done;
 
@@ -493,7 +542,23 @@ let toastTimer;function toast(m){const t=$('toast');t.textContent=m;t.classList.
 function fullscreen(){if(document.fullscreenElement)document.exitFullscreen?.();else document.documentElement.requestFullscreen?.().catch(()=>toast('Tela cheia não disponível neste navegador'))}
 
 /* ---------- Ligações ---------- */
-['warmup','duration','interval','volume','sound','voice'].forEach(id=>{
+/* seletor de voz */
+(function(){
+ const sel=$('voz'),grp=(label,g)=>{const og=document.createElement('optgroup');og.label=label;
+  VOZES.lista.filter(v=>v.genero===g).forEach(v=>og.appendChild(new Option(`${v.nome} — ${v.desc}`,v.id)));sel.appendChild(og)};
+ grp('Vozes naturais · femininas','F');grp('Vozes naturais · masculinas','M');
+ const og=document.createElement('optgroup');og.label='Outras';
+ og.appendChild(new Option('Voz do aparelho (robótica)','sistema'));og.appendChild(new Option('Sem voz','off'));sel.appendChild(og);
+ sel.value=cfg.voz;
+ const info=()=>{const v=VOZES.lista.find(x=>x.id===cfg.voz);
+  $('voiceInfo').textContent=v?(VOZES.lazy?'Voz natural: baixada uma vez e depois funciona sem internet.':'Voz natural gravada no app: funciona sem internet.'):cfg.voz==='sistema'?'Usa a voz instalada no celular ou computador.':'Os exercícios não serão anunciados (os bipes continuam).';
+  $('voicePreview').disabled=cfg.voz==='off'};
+ info();
+ sel.addEventListener('change',()=>{cfg.voz=sel.value;if(cfg.voz!=='off')lastVoz=cfg.voz;save();try{localStorage.setItem(STORE+'_voz','1')}catch{}info();stopVoice();preloadVoice();if(cfg.voz!=='off')say('demo','Olá! Esta é a voz do aparelho.',0)});
+ $('voicePreview').addEventListener('click',()=>{getCtx();say('demo','Olá! Esta é a voz do aparelho. Vou conduzir o seu aquecimento.',0)});
+ window.setVoz=v=>{sel.value=v;sel.dispatchEvent(new Event('change'))};
+})();
+['warmup','duration','interval','volume','sound'].forEach(id=>{
  const el=$(id);
  if(el.type==='checkbox')el.checked=!!cfg[id];
  else if([...el.options].some(o=>o.value===String(cfg[id])))el.value=String(cfg[id]);
@@ -501,7 +566,6 @@ function fullscreen(){if(document.fullscreenElement)document.exitFullscreen?.();
  el.addEventListener('change',()=>{
   cfg[id]=el.type==='checkbox'?el.checked:(id==='volume'?+el.value:+el.value);save();
   if(['warmup','duration','interval'].includes(id)){rebuild();toast('Tempo atualizado')}
-  else if(id==='voice'&&!cfg.voice){try{speechSynthesis.cancel()}catch{}}
   else render();
  });
 });
@@ -523,7 +587,7 @@ document.addEventListener('keydown',e=>{
  else if(k==='KeyR')reset();
  else if(k==='KeyF')fullscreen();
  else if(k==='KeyA')setMode(cfg.mode==='auto'?'manual':'auto');
- else if(k==='KeyM'){cfg.voice=!cfg.voice;$('voice').checked=cfg.voice;save();toast(cfg.voice?'Voz ativada':'Voz desativada')}
+ else if(k==='KeyM'){setVoz(cfg.voz==='off'?lastVoz:'off');toast(cfg.voz==='off'?'Voz desativada':'Voz ativada')}
 });
 document.addEventListener('visibilitychange',()=>{if(!document.hidden&&state==='running'){lockScreen();update()}});
 if(!document.documentElement.requestFullscreen||matchMedia('(display-mode: standalone)').matches)$('fullscreen').hidden=true;
